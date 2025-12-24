@@ -1,10 +1,12 @@
 // index.js
+import http from "http";
 import TelegramBot from "node-telegram-bot-api";
 import { createClient } from "@supabase/supabase-js";
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_ANON_KEY;
+const PORT = parseInt(process.env.PORT || "3000", 10);
 
 if (!BOT_TOKEN) {
   console.error("Missing BOT_TOKEN env var");
@@ -15,9 +17,7 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
   process.exit(1);
 }
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
-  // optional: set fetch or global options here
-});
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
@@ -51,7 +51,6 @@ bot.onText(/^\/help$/, async (msg) => {
 bot.onText(/^\/devices$/, async (msg) => {
   const chatId = msg.chat.id;
   try {
-    // read devices from supabase
     const { data, error } = await supabase
       .from("devices")
       .select("id, online, display_name")
@@ -69,7 +68,6 @@ bot.onText(/^\/devices$/, async (msg) => {
       return;
     }
 
-    // Format message
     const lines = data.map((d) => {
       const id = d.id ?? "<unknown-id>";
       const name = d.display_name ?? id;
@@ -78,7 +76,6 @@ bot.onText(/^\/devices$/, async (msg) => {
       return `• ${name} — ${status} (id: ${id})`;
     });
 
-    // If long, split into multiple messages
     const msgText = `Devices (${data.length}):\n` + lines.join("\n");
     await bot.sendMessage(chatId, msgText);
   } catch (e) {
@@ -87,15 +84,44 @@ bot.onText(/^\/devices$/, async (msg) => {
   }
 });
 
-// Optional: graceful shutdown hooks (Render restarts)
+// Simple HTTP server so Render detects a port (health check + simple root)
+const server = http.createServer((req, res) => {
+  try {
+    if (req.url === "/health" || req.url === "/") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      const payload = {
+        status: "ok",
+        bot: "polling",
+        timestamp: new Date().toISOString(),
+      };
+      res.end(JSON.stringify(payload));
+      return;
+    }
+
+    // fallback for any other path
+    res.writeHead(404, { "Content-Type": "text/plain" });
+    res.end("Not found");
+  } catch (err) {
+    res.writeHead(500, { "Content-Type": "text/plain" });
+    res.end("Server error");
+    console.error("HTTP handler error:", err);
+  }
+});
+
+server.listen(PORT, () => {
+  console.log(`HTTP server listening on port ${PORT}`);
+  console.log("Telegram bot started (polling).");
+});
+
+// graceful shutdown
 const shutdown = async () => {
-  console.log("Shutting down bot...");
+  console.log("Shutting down...");
   try {
     await bot.stopPolling();
   } catch (_) {}
-  process.exit(0);
+  server.close(() => {
+    process.exit(0);
+  });
 };
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
-
-console.log("Telegram bot started (polling).");
