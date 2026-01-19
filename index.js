@@ -25,13 +25,12 @@ const pendingSubs = new Map(); // cmdId -> { resolve, reject, timeout, sub }
 async function validateDevice(deviceId) {
   const { data, error } = await supabase
     .from("devices")
-    .select("id, online, enabled, consent")
+    .select("id, online, consent")
     .eq("id", deviceId)
     .maybeSingle();
 
   if (error) return { ok: false, error: error.message };
   if (!data) return { ok: false, error: "device_not_found" };
-  if (!data.enabled) return { ok: false, error: "device_disabled" };
   if (!data.consent) return { ok: false, error: "device_no_consent" };
   if (!data.online) return { ok: false, error: "device_offline" };
   return { ok: true };
