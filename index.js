@@ -1,44 +1,38 @@
 // index.js
 import http from "http";
-import TelegramBot from "node-telegram-bot-api";
 import { createClient } from "@supabase/supabase-js";
+import TelegramBot from "node-telegram-bot-api";
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
+const WEBHOOK_URL = process.env.WEBHOOK_URL; // e.g. https://your-app.onrender.com
 const PORT = parseInt(process.env.PORT || "3000", 10);
 
 if (!BOT_TOKEN) throw new Error("Missing BOT_TOKEN");
 if (!SUPABASE_URL) throw new Error("Missing SUPABASE_URL");
 if (!SUPABASE_SERVICE_KEY) throw new Error("Missing SUPABASE_SERVICE_KEY (service role)");
+if (!WEBHOOK_URL) throw new Error("Missing WEBHOOK_URL (HTTPS)");
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
   realtime: { params: { eventsPerSecond: 50 } },
 });
-const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+
+// webhook mode (no polling)
+const bot = new TelegramBot(BOT_TOKEN, { polling: false });
 
 /* in-memory state */
 const chatState = new Map(); // chatId -> { deviceId, cwd }
-const pendingSubs = new Map(); // cmdId -> { resolve, reject, timeout, sub, promise }
+const pendingSubs = new Map(); // cmdId -> { resolve,reject,timeout,sub,promise }
 
-/* simple per-chat rate limiter */
-const lastCmd = new Map(); // chatId -> timestamp
-function canRun(chatId, ms = 700) {
-  const now = Date.now();
-  const last = lastCmd.get(chatId) || 0;
-  if (now - last < ms) return false;
-  lastCmd.set(chatId, now);
-  return true;
-}
+/* ===========================
+   Helpers / Formatters
+   =========================== */
 
-/* helpers */
-
-// Normalize/resolve paths (relative -> absolute based on cwd)
 function resolvePath(cwd, input) {
   if (!input || input.trim() === "") return cwd;
-  const p = input.trim();
+  const p = String(input).trim();
   if (p.startsWith("/")) return p;
-  // remove trailing slash from cwd, then append
   return `${cwd.replace(/\/+$/, "")}/${p}`;
 }
 
@@ -66,7 +60,6 @@ function formatInfo(obj) {
   return lines.join("\n");
 }
 
-// Accepts many listing shapes and returns lines array
 function formatListing(result, requestedPath = "") {
   const lines = [];
   lines.push(`📂 Listing: ${requestedPath || ""}`);
@@ -74,7 +67,6 @@ function formatListing(result, requestedPath = "") {
     lines.push("No result.");
     return lines;
   }
-
   if (Array.isArray(result.entries) && result.entries.length > 0) {
     const folders = [];
     const files = [];
@@ -93,7 +85,6 @@ function formatListing(result, requestedPath = "") {
     }
     return lines;
   }
-
   if (Array.isArray(result.folders) || Array.isArray(result.files)) {
     if (Array.isArray(result.folders) && result.folders.length) {
       lines.push("\n📁 Folders:");
@@ -105,12 +96,10 @@ function formatListing(result, requestedPath = "") {
     }
     return lines;
   }
-
   if (result.count !== undefined && result.count === 0) {
     lines.push("No entries.");
     return lines;
   }
-
   lines.push("```json");
   try {
     lines.push(JSON.stringify(result, null, 2));
@@ -121,7 +110,6 @@ function formatListing(result, requestedPath = "") {
   return lines;
 }
 
-// Build ASCII tree from entries: expects entries array with path + type
 function buildTreeFromEntries(entries, rootPath) {
   const root = (rootPath || "").replace(/\/+$/, "");
   const map = { _children: {} };
@@ -165,7 +153,10 @@ function buildTreeFromEntries(entries, rootPath) {
   return lines;
 }
 
-/* DB helpers */
+/* ===========================
+   DB helpers
+   =========================== */
+
 async function validateDevice(deviceId) {
   const { data, error } = await supabase
     .from("devices")
@@ -211,7 +202,9 @@ async function sendCommand(deviceId, action, payload = {}) {
   return data;
 }
 
-// Realtime wait: subscribe to UPDATEs for this id. fallback to polling on timeout/failure.
+/* ===========================
+   Realtime wait (subscribe + polling fallback)
+   =========================== */
 function waitForResultRealtime(cmdId, timeoutMs = 90_000) {
   if (!cmdId) return Promise.reject(new Error("missing_cmd_id"));
   if (pendingSubs.has(cmdId)) return pendingSubs.get(cmdId).promise;
@@ -255,7 +248,6 @@ function waitForResultRealtime(cmdId, timeoutMs = 90_000) {
         .select("status, result")
         .eq("id", cmdId)
         .maybeSingle();
-
       if (data && (data.status === "done" || data.status === "failed")) {
         cleanup(true, data);
       }
@@ -268,9 +260,7 @@ function waitForResultRealtime(cmdId, timeoutMs = 90_000) {
     clearInterval(poller);
     if (r.timeout) clearTimeout(r.timeout);
     if (r.sub) {
-      try {
-        supabase.removeChannel(r.sub);
-      } catch (_) {}
+      try { supabase.removeChannel(r.sub); } catch (_) {}
     }
     pendingSubs.delete(cmdId);
     if (success) r.resolve(data);
@@ -284,7 +274,6 @@ function waitForResultRealtime(cmdId, timeoutMs = 90_000) {
         .select("status, result")
         .eq("id", cmdId)
         .maybeSingle();
-
       if (data && (data.status === "done" || data.status === "failed")) {
         cleanup(true, data);
         return;
@@ -296,54 +285,50 @@ function waitForResultRealtime(cmdId, timeoutMs = 90_000) {
   return promise;
 }
 
-/* BOT COMMANDS */
+/* ===========================
+   Bot commands
+   =========================== */
 
-// /start
 bot.onText(/^\/start$/i, (msg) => {
   const text = [
     "✅ Bot online",
     "/use <device_id> — select device",
     "/devices — list devices",
-    "/exit — exit selected device",
-    "/help — view help commands",
+    "/exit — clear selected device",
+    "/help — view help",
   ].join("\n");
   bot.sendMessage(msg.chat.id, text);
 });
 
-// /help
 bot.onText(/^\/help$/i, (msg) => {
   const text = [
     "*Quick Help*",
     "/use `<device_id>` — choose device",
     "/devices — show available devices",
-    "/ls [path] — list files; defaults to cwd",
-    "/tree [path] — recursive tree (bounded)",
+    "/ls [path] — list files",
+    "/tree [path] — recursive tree",
     "/cd `<path>` — change working directory",
-    "/upload `<path>` — prepare & upload file from device storage",
+    "/pwd — show working directory",
+    "/upload `<path>` — upload file from device storage",
     "/ping — simple ping",
-    "/info — get device info (friendly)",
+    "/info — device info (friendly)",
     "/exit — stop using current device",
   ].join("\n\n");
   bot.sendMessage(msg.chat.id, text, { parse_mode: "Markdown" });
 });
 
-// /devices (include last_seen human readable)
+// /devices — show devices; show LAST_SEEN only for offline devices
 bot.onText(/^\/devices$/i, async (msg) => {
   try {
-    const { data } = await supabase
-      .from("devices")
-      .select("id, online, last_seen")
-      .order("last_seen", { ascending: false });
-
+    const { data } = await supabase.from("devices").select("id, online, last_seen").order("last_seen", { ascending: false });
     if (!data?.length) {
       bot.sendMessage(msg.chat.id, "No devices.");
       return;
     }
-
     const now = Date.now();
     const lines = data.map(d => {
       let seen = "";
-      if (d.last_seen) {
+      if (!d.online && d.last_seen) {
         try {
           const diff = now - new Date(d.last_seen).getTime();
           const sec = Math.floor(diff / 1000);
@@ -356,14 +341,13 @@ bot.onText(/^\/devices$/i, async (msg) => {
       }
       return `• ${d.id} — ${d.online ? "online ✅" : "offline ❌"}${seen}`;
     });
-
     bot.sendMessage(msg.chat.id, lines.join("\n"));
   } catch (e) {
     bot.sendMessage(msg.chat.id, `Error listing devices: ${e.message || e}`);
   }
 });
 
-// /use <device>
+// /use <device_id>
 bot.onText(/^\/use\s+(.+)$/i, async (msg, m) => {
   const deviceId = m[1].trim();
   const v = await validateDevice(deviceId);
@@ -383,10 +367,6 @@ bot.onText(/^\/exit$/i, (msg) => {
 
 // /cd <path>
 bot.onText(/^\/cd\s+(.+)$/i, (msg, m) => {
-  if (!canRun(msg.chat.id)) {
-    bot.sendMessage(msg.chat.id, "⏳ Slow down a bit…");
-    return;
-  }
   const st = chatState.get(msg.chat.id);
   if (!st) {
     bot.sendMessage(msg.chat.id, "❌ Select device first with /use");
@@ -397,12 +377,18 @@ bot.onText(/^\/cd\s+(.+)$/i, (msg, m) => {
   bot.sendMessage(msg.chat.id, `📂 cwd = ${st.cwd}`);
 });
 
-// /ls [path]
-bot.onText(/^\/ls(?:\s+(.*))?$/i, async (msg, m) => {
-  if (!canRun(msg.chat.id)) {
-    bot.sendMessage(msg.chat.id, "⏳ Slow down a bit…");
+// /pwd
+bot.onText(/^\/pwd$/i, (msg) => {
+  const st = chatState.get(msg.chat.id);
+  if (!st) {
+    bot.sendMessage(msg.chat.id, "❌ No device selected. Use /use <device_id>");
     return;
   }
+  bot.sendMessage(msg.chat.id, `📁 cwd: ${st.cwd}`);
+});
+
+// /ls [path]
+bot.onText(/^\/ls(?:\s+(.*))?$/i, async (msg, m) => {
   const deviceId = await getSelectedDevice(msg.chat.id);
   if (!deviceId) return;
   const st = chatState.get(msg.chat.id);
@@ -424,20 +410,15 @@ bot.onText(/^\/ls(?:\s+(.*))?$/i, async (msg, m) => {
   }
 });
 
-// /tree [path] (bounded)
+// /tree [path] — bounded recursive tree
 bot.onText(/^\/tree(?:\s+(.*))?$/i, async (msg, m) => {
-  if (!canRun(msg.chat.id, 1200)) {
-    bot.sendMessage(msg.chat.id, "⏳ Slow down a bit…");
-    return;
-  }
   const deviceId = await getSelectedDevice(msg.chat.id);
   if (!deviceId) return;
   const st = chatState.get(msg.chat.id);
   const requested = (m[1]?.trim() || st.cwd);
   const path = resolvePath(st.cwd, requested);
-
   try {
-    // ask device for recursive listing; include a soft maxDepth hint
+    // hint to device: recursive listing with maxDepth and limit
     const cmd = await sendCommand(deviceId, "list_files", { path, recursive: true, maxDepth: 5, limit: 1500 });
     const res = await waitForResultRealtime(cmd.id, 120_000);
     const payload = res.result ?? res;
@@ -445,11 +426,9 @@ bot.onText(/^\/tree(?:\s+(.*))?$/i, async (msg, m) => {
     if (payload && payload.cwd) st.cwd = payload.cwd;
 
     let lines = [];
-    if (Array.isArray(payload.entries) && payload.entries.length) {
-      if (payload.entries.length > 1500) {
-        lines.push("⚠️ Tree truncated (too many files)");
-      }
-      lines = buildTreeFromEntries(payload.entries, path);
+    if (Array.isArray(payload.entries) && payload.entries.length > 2000) {
+      await bot.sendMessage(msg.chat.id, "⚠️ Too many files. Tree truncated.");
+      payload.entries = payload.entries.slice(0, 2000);
     } else if (Array.isArray(payload.files) || Array.isArray(payload.folders)) {
       const entries = [];
       if (Array.isArray(payload.folders)) payload.folders.forEach(f => entries.push({ path: `${path.replace(/\/$/, "")}/${f}`, type: "dir" }));
@@ -459,9 +438,7 @@ bot.onText(/^\/tree(?:\s+(.*))?$/i, async (msg, m) => {
       lines = ["```json", JSON.stringify(payload, null, 2), "```"];
     }
 
-    for (const chunk of chunkMessage(lines.join("\n"))) {
-      await bot.sendMessage(msg.chat.id, chunk, { parse_mode: "Markdown" });
-    }
+    for (const chunk of chunkMessage(lines.join("\n"))) await bot.sendMessage(msg.chat.id, chunk, { parse_mode: "Markdown" });
   } catch (e) {
     bot.sendMessage(msg.chat.id, `❌ tree failed: ${e.message || e}`);
   }
@@ -469,10 +446,6 @@ bot.onText(/^\/tree(?:\s+(.*))?$/i, async (msg, m) => {
 
 // /upload <path_on_device>
 bot.onText(/^\/upload\s+(.+)$/i, async (msg, m) => {
-  if (!canRun(msg.chat.id)) {
-    bot.sendMessage(msg.chat.id, "⏳ Slow down a bit…");
-    return;
-  }
   const chatId = msg.chat.id;
   const deviceId = await getSelectedDevice(chatId);
   if (!deviceId) return;
@@ -512,21 +485,14 @@ bot.onText(/^\/upload\s+(.+)$/i, async (msg, m) => {
 
 // /ping
 bot.onText(/^\/ping$/i, async (msg) => {
-  if (!canRun(msg.chat.id, 500)) {
-    bot.sendMessage(msg.chat.id, "⏳ Slow down a bit…");
-    return;
-  }
   const deviceId = await getSelectedDevice(msg.chat.id);
   if (!deviceId) return;
   try {
     const cmd = await sendCommand(deviceId, "ping");
     const res = await waitForResultRealtime(cmd.id);
     const payload = res.result ?? res;
-    if (payload && payload.ts) {
-      bot.sendMessage(msg.chat.id, `🏓 Pong — ts: ${payload.ts}`);
-    } else {
-      bot.sendMessage(msg.chat.id, "🏓 Pong");
-    }
+    if (payload && payload.ts) bot.sendMessage(msg.chat.id, `🏓 Pong — ts: ${payload.ts}`);
+    else bot.sendMessage(msg.chat.id, "🏓 Pong");
   } catch (e) {
     bot.sendMessage(msg.chat.id, `❌ ping failed: ${e.message || e}`);
   }
@@ -534,16 +500,17 @@ bot.onText(/^\/ping$/i, async (msg) => {
 
 // /info (friendly)
 bot.onText(/^\/info$/i, async (msg) => {
-  if (!canRun(msg.chat.id, 500)) {
-    bot.sendMessage(msg.chat.id, "⏳ Slow down a bit…");
-    return;
-  }
   const deviceId = await getSelectedDevice(msg.chat.id);
   if (!deviceId) return;
   try {
     const cmd = await sendCommand(deviceId, "device_info");
     const res = await waitForResultRealtime(cmd.id);
     const payload = res.result ?? res;
+
+    // update local cwd if device returns one
+    const st = chatState.get(msg.chat.id);
+    if (payload && payload.cwd && st) st.cwd = payload.cwd;
+
     const text = formatInfo(payload);
     for (const chunk of chunkMessage(text)) await bot.sendMessage(msg.chat.id, chunk, { parse_mode: "Markdown" });
   } catch (e) {
@@ -551,21 +518,78 @@ bot.onText(/^\/info$/i, async (msg) => {
   }
 });
 
-/* HTTP health / dummy connected link */
-http.createServer(async (req, res) => {
-  if (req.url === "/") {
-    const connectedChats = Array.from(chatState.keys()).length;
-    const activeSubs = Array.from(pendingSubs.keys()).length;
-    const u = { ok: true, uptime: process.uptime(), connectedChats, activePendingCommands: activeSubs };
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify(u));
-    return;
-  }
-  res.writeHead(404);
-  res.end("not found");
-}).listen(PORT, () => console.log(`🚀 Bot + health running on port ${PORT}`));
+/* ===========================
+   Webhook server + health
+   =========================== */
 
-/* global error guards */
+async function ensureWebhook() {
+  try {
+    const hook = `${WEBHOOK_URL.replace(/\/$/, "")}/bot${BOT_TOKEN}`;
+    await bot.setWebHook(hook);
+    console.log("Webhook set to:", hook);
+  } catch (err) {
+    console.error("Failed to set webhook:", err?.response?.body || err?.message || err);
+    if (err?.response?.statusCode === 409 || (err?.message && err.message.includes("409"))) {
+      console.error("Conflict while setting webhook (409). Ensure no other bot instance is running with getUpdates/polling.");
+    }
+  }
+}
+
+await ensureWebhook();
+
+const server = http.createServer(async (req, res) => {
+  try {
+    // webhook receiver
+    if (req.method === "POST" && req.url === `/bot${BOT_TOKEN}`) {
+      let body = "";
+      req.on("data", chunk => (body += chunk));
+      req.on("end", async () => {
+        try {
+          if (!body) {
+            res.writeHead(400); res.end("no body"); return;
+          }
+          const json = JSON.parse(body);
+          await bot.processUpdate(json);
+          res.writeHead(200); res.end("ok");
+        } catch (e) {
+          console.error("processUpdate error:", e);
+          res.writeHead(500); res.end("error");
+        }
+      });
+      return;
+    }
+
+    // health / root
+    if (req.method === "GET" && req.url === "/") {
+      const connectedChats = Array.from(chatState.keys()).length;
+      const activeSubs = Array.from(pendingSubs.keys()).length;
+      const u = { ok: true, uptime: process.uptime(), connectedChats, activePendingCommands: activeSubs };
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(u));
+      return;
+    }
+
+    res.writeHead(404); res.end("not found");
+  } catch (e) {
+    console.error("server error:", e);
+    res.writeHead(500); res.end("fatal");
+  }
+});
+
+server.listen(PORT, async () => {
+  console.log(`🚀 Webhook server listening on port ${PORT}`);
+  console.log(`Webhook endpoint: POST ${WEBHOOK_URL.replace(/\/$/, "")}/bot${BOT_TOKEN}`);
+
+  await ensureWebhook();
+});
+
+/* housekeeping: friendly error guards */
+bot.on("polling_error", (err) => {
+  // should not occur in webhook mode, but keep for diagnostics
+  console.warn("polling_error:", err?.message || err);
+  if (err?.response?.body) console.warn("->", err.response.body);
+});
+
 process.on("unhandledRejection", (e) => {
   console.error("Unhandled promise:", e);
 });
