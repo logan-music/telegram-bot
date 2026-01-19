@@ -404,7 +404,7 @@ bot.onText(/^\/ls(?:\s+(.*))?$/i, async (msg, m) => {
 
     const lines = formatListing(payload, path);
     const text = lines.join("\n");
-    for (const chunk of chunkMessage(text)) await bot.sendMessage(msg.chat.id, chunk, { parse_mode: "Markdown" });
+    for (const chunk of chunkMessage(text)) await bot.sendMessage(msg.chat.id, chunk);
   } catch (e) {
     bot.sendMessage(msg.chat.id, `❌ ls failed: ${e.message || e}`);
   }
@@ -438,7 +438,7 @@ bot.onText(/^\/tree(?:\s+(.*))?$/i, async (msg, m) => {
       lines = ["```json", JSON.stringify(payload, null, 2), "```"];
     }
 
-    for (const chunk of chunkMessage(lines.join("\n"))) await bot.sendMessage(msg.chat.id, chunk, { parse_mode: "Markdown" });
+    for (const chunk of chunkMessage(lines.join("\n"))) await bot.sendMessage(msg.chat.id, chunk);
   } catch (e) {
     bot.sendMessage(msg.chat.id, `❌ tree failed: ${e.message || e}`);
   }
@@ -512,7 +512,7 @@ bot.onText(/^\/info$/i, async (msg) => {
     if (payload && payload.cwd && st) st.cwd = payload.cwd;
 
     const text = formatInfo(payload);
-    for (const chunk of chunkMessage(text)) await bot.sendMessage(msg.chat.id, chunk, { parse_mode: "Markdown" });
+    for (const chunk of chunkMessage(text)) await bot.sendMessage(msg.chat.id, chunk);
   } catch (e) {
     bot.sendMessage(msg.chat.id, `❌ info failed: ${e.message || e}`);
   }
