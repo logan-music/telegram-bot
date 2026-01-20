@@ -25,9 +25,9 @@ const bot = new TelegramBot(BOT_TOKEN, { polling: false });
 const chatState = new Map(); // chatId -> { deviceId, cwd }
 const pendingSubs = new Map(); // cmdId -> { resolve,reject,timeout,sub,promise }
 
-/* ===========================
+/* ================
    Helpers / Formatters
-   =========================== */
+   ================ */
 
 function resolvePath(cwd, input) {
   if (!input || input.trim() === "") return cwd;
@@ -49,7 +49,6 @@ function safeString(s) {
 
 function formatInfo(obj) {
   const lines = [];
-  lines.push("📱 *Device Info*");
   if (obj.brand) lines.push(`Brand: ${safeString(obj.brand)}`);
   if (obj.model) lines.push(`Model: ${safeString(obj.model)}`);
   if (obj.device) lines.push(`Device: ${safeString(obj.device)}`);
@@ -60,102 +59,74 @@ function formatInfo(obj) {
   return lines.join("\n");
 }
 
-function formatListing(result, requestedPath = "") {
+/**
+ * New formatListing: returns plain, human-friendly list (folders first then files)
+ * Example output:
+ * Android
+ * Images
+ * Download
+ * Movies
+ * test.py
+ * 5000.py
+ */
+function formatListingPlain(result, requestedPath = "") {
   const lines = [];
-  lines.push(`📂 Listing: ${requestedPath || ""}`);
+  lines.push(`Listing: ${requestedPath || ""}`);
   if (!result) {
     lines.push("No result.");
     return lines;
   }
-  if (Array.isArray(result.entries) && result.entries.length > 0) {
+
+  // Preferred: result.entries = [{name, path, type, size}]
+  if (Array.isArray(result.entries) && result.entries.length >= 0) {
     const folders = [];
     const files = [];
     for (const e of result.entries) {
-      const t = (e.type || "").toString();
-      if (t === "dir" || t === "directory" || (e.path && e.path.endsWith("/"))) folders.push(e);
-      else files.push(e);
+      const t = (e.type || "").toString().toLowerCase();
+      const name = safeString(e.name || e.path || "");
+      if (!name) continue;
+      if (t === "dir" || t === "directory" || (e.path && e.path.endsWith("/"))) folders.push(name);
+      else files.push(name);
     }
-    if (folders.length) {
-      lines.push("\n📁 Folders:");
-      folders.forEach(f => lines.push(`• ${safeString(f.name || f.path)}`));
-    }
-    if (files.length) {
-      lines.push("\n📄 Files:");
-      files.forEach(f => lines.push(`• ${safeString(f.name || f.path)} — ${safeString(f.size ?? "")} bytes`));
-    }
+    // sort alphabetically within groups
+    folders.sort((a,b)=>a.localeCompare(b));
+    files.sort((a,b)=>a.localeCompare(b));
+    // combine (folders first, then files) as requested
+    for (const f of folders) lines.push(f);
+    for (const f of files) lines.push(f);
     return lines;
   }
-  if (Array.isArray(result.folders) || Array.isArray(result.files)) {
-    if (Array.isArray(result.folders) && result.folders.length) {
-      lines.push("\n📁 Folders:");
-      result.folders.forEach(f => lines.push(`• ${safeString(f)}`));
-    }
-    if (Array.isArray(result.files) && result.files.length) {
-      lines.push("\n📄 Files:");
-      result.files.forEach(f => lines.push(`• ${safeString(f)}`));
-    }
+
+  // Older shape: result.folders / result.files arrays
+  if ((Array.isArray(result.folders) && result.folders.length) || (Array.isArray(result.files) && result.files.length)) {
+    const folders = Array.isArray(result.folders) ? result.folders.map(s => safeString(s)) : [];
+    const files = Array.isArray(result.files) ? result.files.map(s => safeString(s)) : [];
+    folders.sort((a,b)=>a.localeCompare(b));
+    files.sort((a,b)=>a.localeCompare(b));
+    for (const f of folders) lines.push(f);
+    for (const f of files) lines.push(f);
     return lines;
   }
-  if (result.count !== undefined && result.count === 0) {
-    lines.push("No entries.");
+
+  // Fallback: if result is a simple array of names
+  if (Array.isArray(result) && result.length) {
+    const names = result.map(r => safeString(r)).sort((a,b) => a.localeCompare(b));
+    for (const n of names) lines.push(n);
     return lines;
   }
-  lines.push("```json");
+
+  // Last fallback: pretty JSON string but plain text (avoid Markdown entities)
   try {
     lines.push(JSON.stringify(result, null, 2));
   } catch (e) {
     lines.push(String(result));
   }
-  lines.push("```");
   return lines;
 }
 
-function buildTreeFromEntries(entries, rootPath) {
-  const root = (rootPath || "").replace(/\/+$/, "");
-  const map = { _children: {} };
-  for (const e of entries) {
-    const p = (e.path || e.name || "").toString();
-    const rel = root && p.startsWith(root) ? p.slice(root.length).replace(/^\/+/, "") : p;
-    if (!rel) continue;
-    const parts = rel.split("/").filter(Boolean);
-    let cur = map;
-    for (let i = 0; i < parts.length; i++) {
-      const part = parts[i];
-      if (!cur._children) cur._children = {};
-      if (!cur._children[part]) cur._children[part] = { _meta: null, _children: {} };
-      if (i === parts.length - 1) {
-        cur._children[part]._meta = { type: e.type || (e.path && e.path.endsWith("/") ? "dir" : "file"), raw: e };
-      }
-      cur = cur._children[part];
-    }
-  }
-
-  function render(nodeChildren, prefix = "") {
-    const names = Object.keys(nodeChildren || {}).sort((a, b) => a.localeCompare(b));
-    const out = [];
-    for (let i = 0; i < names.length; i++) {
-      const name = names[i];
-      const isLast = i === names.length - 1;
-      const meta = nodeChildren[name]._meta;
-      const typ = (meta && meta.type) ? meta.type : "file";
-      const line = `${prefix}${isLast ? "└─ " : "├─ "}${name}${typ && typ.startsWith("dir") ? "/" : ""}`;
-      out.push(line);
-      const child = nodeChildren[name]._children;
-      if (child && Object.keys(child).length) {
-        out.push(...render(child, `${prefix}${isLast ? "   " : "│  "}`));
-      }
-    }
-    return out;
-  }
-
-  const rootChildren = map._children || map;
-  const lines = [`📂 Tree: ${rootPath || "/"}`, ...render(rootChildren)];
-  return lines;
-}
-
-/* ===========================
+/* ================
    DB helpers
-   =========================== */
+   ================ */
 
 async function validateDevice(deviceId) {
   const { data, error } = await supabase
@@ -204,6 +175,7 @@ async function sendCommand(deviceId, action, payload = {}) {
 
 /* ===========================
    Realtime wait (subscribe + polling fallback)
+   same as before (realtime first, poll fallback)
    =========================== */
 function waitForResultRealtime(cmdId, timeoutMs = 90_000) {
   if (!cmdId) return Promise.reject(new Error("missing_cmd_id"));
@@ -286,9 +258,10 @@ function waitForResultRealtime(cmdId, timeoutMs = 90_000) {
 }
 
 /* ===========================
-   Bot commands
+   Bot command handlers
    =========================== */
 
+// /start
 bot.onText(/^\/start$/i, (msg) => {
   const text = [
     "✅ Bot online",
@@ -300,21 +273,24 @@ bot.onText(/^\/start$/i, (msg) => {
   bot.sendMessage(msg.chat.id, text);
 });
 
+// /help (plain text)
 bot.onText(/^\/help$/i, (msg) => {
   const text = [
-    "*Quick Help*",
-    "/use `<device_id>` — choose device",
+    "Quick Help:",
+    "/use <device_id> — choose device",
     "/devices — show available devices",
-    "/ls [path] — list files",
-    "/tree [path] — recursive tree",
-    "/cd `<path>` — change working directory",
+    "/ls [path] — list files (defaults to cwd)",
+    "/tree [path] — recursive tree (bounded)",
+    "/cd <path> — change working directory",
     "/pwd — show working directory",
-    "/upload `<path>` — upload file from device storage",
+    "/upload <path> — prepare & upload file from device storage",
+    "/rm <path> — remove file",
+    "/rd <path> — remove directory recursively",
     "/ping — simple ping",
     "/info — device info (friendly)",
     "/exit — stop using current device",
-  ].join("\n\n");
-  bot.sendMessage(msg.chat.id, text, { parse_mode: "Markdown" });
+  ].join("\n");
+  bot.sendMessage(msg.chat.id, text);
 });
 
 // /devices — show devices; show LAST_SEEN only for offline devices
@@ -347,7 +323,7 @@ bot.onText(/^\/devices$/i, async (msg) => {
   }
 });
 
-// /use <device_id>
+// /use <device>
 bot.onText(/^\/use\s+(.+)$/i, async (msg, m) => {
   const deviceId = m[1].trim();
   const v = await validateDevice(deviceId);
@@ -387,7 +363,7 @@ bot.onText(/^\/pwd$/i, (msg) => {
   bot.sendMessage(msg.chat.id, `📁 cwd: ${st.cwd}`);
 });
 
-// /ls [path]
+/* ===== /ls (fast + combined plain list) ===== */
 bot.onText(/^\/ls(?:\s+(.*))?$/i, async (msg, m) => {
   const deviceId = await getSelectedDevice(msg.chat.id);
   if (!deviceId) return;
@@ -395,22 +371,22 @@ bot.onText(/^\/ls(?:\s+(.*))?$/i, async (msg, m) => {
   const requested = (m[1]?.trim() || st.cwd);
   const path = resolvePath(st.cwd, requested);
   try {
-    const cmd = await sendCommand(deviceId, "list_files", { path });
-    const res = await waitForResultRealtime(cmd.id);
-    const payload = res.result?.result ?? res.result ?? res;
+    // hint device to limit work: send limit param (device should honor)
+    const cmd = await sendCommand(deviceId, "list_files", { path, limit: 500 });
+    // give ls a bit more time (30s)
+    const res = await waitForResultRealtime(cmd.id, 30_000);
+    const payload = (res && (res.result ?? res)) || res;
 
-    // auto-sync cwd if device returned it
     if (payload && payload.cwd) st.cwd = payload.cwd;
 
-    const lines = formatListing(payload, path);
-    const text = lines.join("\n");
-    for (const chunk of chunkMessage(text)) await bot.sendMessage(msg.chat.id, chunk);
+    const lines = formatListingPlain(payload, path);
+    for (const chunk of chunkMessage(lines.join("\n"))) await bot.sendMessage(msg.chat.id, chunk);
   } catch (e) {
     bot.sendMessage(msg.chat.id, `❌ ls failed: ${e.message || e}`);
   }
 });
 
-// /tree [path] — bounded recursive tree
+/* ===== /tree (bounded recursive) ===== */
 bot.onText(/^\/tree(?:\s+(.*))?$/i, async (msg, m) => {
   const deviceId = await getSelectedDevice(msg.chat.id);
   if (!deviceId) return;
@@ -418,24 +394,23 @@ bot.onText(/^\/tree(?:\s+(.*))?$/i, async (msg, m) => {
   const requested = (m[1]?.trim() || st.cwd);
   const path = resolvePath(st.cwd, requested);
   try {
-    // hint to device: recursive listing with maxDepth and limit
     const cmd = await sendCommand(deviceId, "list_files", { path, recursive: true, maxDepth: 5, limit: 1500 });
     const res = await waitForResultRealtime(cmd.id, 120_000);
-    const payload = res.result ?? res;
+    const payload = (res && (res.result ?? res)) || res;
 
     if (payload && payload.cwd) st.cwd = payload.cwd;
 
     let lines = [];
-    if (Array.isArray(payload.entries) && payload.entries.length > 2000) {
-      await bot.sendMessage(msg.chat.id, "⚠️ Too many files. Tree truncated.");
-      payload.entries = payload.entries.slice(0, 2000);
+    if (Array.isArray(payload.entries) && payload.entries.length) {
+      if (payload.entries.length > 1500) lines.push("⚠️ Tree truncated (too many files)");
+      lines = lines.concat(buildTreeFromEntries(payload.entries, path));
     } else if (Array.isArray(payload.files) || Array.isArray(payload.folders)) {
       const entries = [];
       if (Array.isArray(payload.folders)) payload.folders.forEach(f => entries.push({ path: `${path.replace(/\/$/, "")}/${f}`, type: "dir" }));
       if (Array.isArray(payload.files)) payload.files.forEach(f => entries.push({ path: `${path.replace(/\/$/, "")}/${f}`, type: "file" }));
       lines = buildTreeFromEntries(entries, path);
     } else {
-      lines = ["```json", JSON.stringify(payload, null, 2), "```"];
+      lines = [JSON.stringify(payload, null, 2)];
     }
 
     for (const chunk of chunkMessage(lines.join("\n"))) await bot.sendMessage(msg.chat.id, chunk);
@@ -444,7 +419,7 @@ bot.onText(/^\/tree(?:\s+(.*))?$/i, async (msg, m) => {
   }
 });
 
-// /upload <path_on_device>
+/* ===== /upload (improved payload handling) ===== */
 bot.onText(/^\/upload\s+(.+)$/i, async (msg, m) => {
   const chatId = msg.chat.id;
   const deviceId = await getSelectedDevice(chatId);
@@ -462,6 +437,7 @@ bot.onText(/^\/upload\s+(.+)$/i, async (msg, m) => {
       bot.sendMessage(chatId, "❌ prepare_upload failed (no payload)");
       return;
     }
+
     const payload = {
       device_id: deviceId,
       source: prepPayload,
@@ -483,14 +459,61 @@ bot.onText(/^\/upload\s+(.+)$/i, async (msg, m) => {
   }
 });
 
+/* ===== /rm (remove file) =====
+   Sends action 'delete_file' with payload { path }
+   Waits for result and reports back.
+*/
+bot.onText(/^\/rm\s+(.+)$/i, async (msg, m) => {
+  const chatId = msg.chat.id;
+  const deviceId = await getSelectedDevice(chatId);
+  if (!deviceId) return;
+  const st = chatState.get(chatId);
+  const requested = m[1].trim();
+  const path = resolvePath(st.cwd, requested);
+
+  bot.sendMessage(chatId, `🗑️ Removing file: ${path}`);
+  try {
+    const cmd = await sendCommand(deviceId, "delete_file", { path });
+    const res = await waitForResultRealtime(cmd.id, 30_000);
+    const payload = res?.result ?? res;
+    if (payload && payload.success) bot.sendMessage(chatId, `✅ Removed ${path}`);
+    else bot.sendMessage(chatId, `❌ remove failed: ${JSON.stringify(payload || res || {})}`);
+  } catch (e) {
+    bot.sendMessage(chatId, `❌ rm error: ${e.message || e}`);
+  }
+});
+
+/* ===== /rd (remove directory recursively) =====
+   Sends action 'delete_dir' (agent should implement)
+*/
+bot.onText(/^\/rd\s+(.+)$/i, async (msg, m) => {
+  const chatId = msg.chat.id;
+  const deviceId = await getSelectedDevice(chatId);
+  if (!deviceId) return;
+  const st = chatState.get(chatId);
+  const requested = m[1].trim();
+  const path = resolvePath(st.cwd, requested);
+
+  bot.sendMessage(chatId, `🗑️ Removing directory (recursively): ${path}`);
+  try {
+    const cmd = await sendCommand(deviceId, "delete_dir", { path });
+    const res = await waitForResultRealtime(cmd.id, 60_000);
+    const payload = res?.result ?? res;
+    if (payload && payload.success) bot.sendMessage(chatId, `✅ Removed directory ${path}`);
+    else bot.sendMessage(chatId, `❌ rd failed: ${JSON.stringify(payload || res || {})}`);
+  } catch (e) {
+    bot.sendMessage(chatId, `❌ rd error: ${e.message || e}`);
+  }
+});
+
 // /ping
 bot.onText(/^\/ping$/i, async (msg) => {
   const deviceId = await getSelectedDevice(msg.chat.id);
   if (!deviceId) return;
   try {
     const cmd = await sendCommand(deviceId, "ping");
-    const res = await waitForResultRealtime(cmd.id);
-    const payload = res.result ?? res;
+    const res = await waitForResultRealtime(cmd.id, 20_000);
+    const payload = res?.result ?? res;
     if (payload && payload.ts) bot.sendMessage(msg.chat.id, `🏓 Pong — ts: ${payload.ts}`);
     else bot.sendMessage(msg.chat.id, "🏓 Pong");
   } catch (e) {
@@ -504,8 +527,8 @@ bot.onText(/^\/info$/i, async (msg) => {
   if (!deviceId) return;
   try {
     const cmd = await sendCommand(deviceId, "device_info");
-    const res = await waitForResultRealtime(cmd.id);
-    const payload = res.result ?? res;
+    const res = await waitForResultRealtime(cmd.id, 20_000);
+    const payload = res?.result ?? res;
 
     // update local cwd if device returns one
     const st = chatState.get(msg.chat.id);
@@ -518,9 +541,9 @@ bot.onText(/^\/info$/i, async (msg) => {
   }
 });
 
-/* ===========================
+/* ================
    Webhook server + health
-   =========================== */
+   ================ */
 
 async function ensureWebhook() {
   try {
