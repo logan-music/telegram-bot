@@ -18,16 +18,16 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
   realtime: { params: { eventsPerSecond: 50 } },
 });
 
-// webhook mode (no polling)
+// webhook (no polling)
 const bot = new TelegramBot(BOT_TOKEN, { polling: false });
 
 /* in-memory state */
 const chatState = new Map(); // chatId -> { deviceId, cwd }
 const pendingSubs = new Map(); // cmdId -> { resolve,reject,timeout,sub,promise }
 
-/* ================
+/* ===========================
    Helpers / Formatters
-   ================ */
+   =========================== */
 
 function resolvePath(cwd, input) {
   if (!input || input.trim() === "") return cwd;
@@ -60,17 +60,19 @@ function formatInfo(obj) {
 }
 
 /**
- * formatListingPlain: returns plain, human-friendly list (folders first then files)
+ * formatListingPlain: returns a plain human-friendly listing
+ * folders first (sorted), then files (sorted)
  */
-function formatListingPlain(result) {
+function formatListingPlain(result, requestedPath = "") {
   const lines = [];
+  lines.push(`Listing: ${requestedPath || ""}`);
   if (!result) {
     lines.push("No result.");
     return lines;
   }
 
-  // Preferred: result.entries = [{name, path, type, size}]
-  if (Array.isArray(result.entries) && result.entries.length >= 0) {
+  // Preferred shape: result.entries = [{name, path, type, size}, ...]
+  if (Array.isArray(result.entries)) {
     const folders = [];
     const files = [];
     for (const e of result.entries) {
@@ -80,17 +82,15 @@ function formatListingPlain(result) {
       if (t === "dir" || t === "directory" || (e.path && e.path.endsWith("/"))) folders.push(name);
       else files.push(name);
     }
-    // sort alphabetically within groups
     folders.sort((a,b)=>a.localeCompare(b));
     files.sort((a,b)=>a.localeCompare(b));
-    // combine (folders first, then files)
     for (const f of folders) lines.push(f);
     for (const f of files) lines.push(f);
     return lines;
   }
 
-  // Older shape: result.folders / result.files arrays
-  if ((Array.isArray(result.folders) && result.folders.length) || (Array.isArray(result.files) && result.files.length)) {
+  // Older shape: result.folders && result.files
+  if (Array.isArray(result.folders) || Array.isArray(result.files)) {
     const folders = Array.isArray(result.folders) ? result.folders.map(s => safeString(s)) : [];
     const files = Array.isArray(result.files) ? result.files.map(s => safeString(s)) : [];
     folders.sort((a,b)=>a.localeCompare(b));
@@ -100,14 +100,14 @@ function formatListingPlain(result) {
     return lines;
   }
 
-  // Fallback: if result is a simple array of names
+  // If result is a bare array of names
   if (Array.isArray(result) && result.length) {
     const names = result.map(r => safeString(r)).sort((a,b) => a.localeCompare(b));
     for (const n of names) lines.push(n);
     return lines;
   }
 
-  // Last fallback: pretty JSON string but plain text
+  // fallback: stringify (plain)
   try {
     lines.push(JSON.stringify(result, null, 2));
   } catch (e) {
@@ -116,9 +116,9 @@ function formatListingPlain(result) {
   return lines;
 }
 
-/* ================
+/* ===========================
    DB helpers
-   ================ */
+   =========================== */
 
 async function validateDevice(deviceId) {
   const { data, error } = await supabase
@@ -248,6 +248,16 @@ function waitForResultRealtime(cmdId, timeoutMs = 90_000) {
   return promise;
 }
 
+/* Utility to normalize various shapes returned by waitForResultRealtime */
+function unwrapResult(res) {
+  if (!res) return null;
+  // res might be: { result: {...}, status: 'done' } or { result: { result: {...} } } etc
+  let payload = res.result ?? res;
+  // if nested again
+  if (payload && payload.result) payload = payload.result;
+  return payload;
+}
+
 /* ===========================
    Bot command handlers
    =========================== */
@@ -264,7 +274,7 @@ bot.onText(/^\/start$/i, (msg) => {
   bot.sendMessage(msg.chat.id, text);
 });
 
-// /help (plain text)
+// /help (plain)
 bot.onText(/^\/help$/i, (msg) => {
   const text = [
     "Quick Help:",
@@ -362,19 +372,13 @@ bot.onText(/^\/ls(?:\s+(.*))?$/i, async (msg, m) => {
   const requested = (m[1]?.trim() || st.cwd);
   const path = resolvePath(st.cwd, requested);
   try {
-    // hint device to limit work: send limit param (device should honor)
     const cmd = await sendCommand(deviceId, "list_files", { path, limit: 500 });
-    // give ls a bit more time (30s)
     const res = await waitForResultRealtime(cmd.id, 30_000);
-    // unwrap result properly
-    const payload = res?.result ?? res ?? {};
-    if (payload && payload.cwd) st.cwd = payload.cwd;
+    const payload = unwrapResult(res) ?? {};
 
-    const lines = formatListingPlain(payload);
-    if (lines.length === 0) {
-      bot.sendMessage(msg.chat.id, "No entries.");
-      return;
-    }
+    if (payload.cwd) st.cwd = payload.cwd;
+
+    const lines = formatListingPlain(payload, path);
     for (const chunk of chunkMessage(lines.join("\n"))) await bot.sendMessage(msg.chat.id, chunk);
   } catch (e) {
     bot.sendMessage(msg.chat.id, `❌ ls failed: ${e.message || e}`);
@@ -382,6 +386,46 @@ bot.onText(/^\/ls(?:\s+(.*))?$/i, async (msg, m) => {
 });
 
 /* ===== /tree (bounded recursive) ===== */
+function buildTreeFromEntries(entries, rootPath) {
+  const root = (rootPath || "").replace(/\/+$/, "");
+  const map = { _children: {} };
+  for (const e of entries) {
+    const p = (e.path || e.name || "").toString();
+    const rel = root && p.startsWith(root) ? p.slice(root.length).replace(/^\/+/, "") : p;
+    if (!rel) continue;
+    const parts = rel.split("/").filter(Boolean);
+    let cur = map;
+    for (let i = 0; i < parts.length; i++) {
+      const part = parts[i];
+      if (!cur._children) cur._children = {};
+      if (!cur._children[part]) cur._children[part] = { _meta: null, _children: {} };
+      if (i === parts.length - 1) {
+        cur._children[part]._meta = { type: e.type || (e.path && e.path.endsWith("/") ? "dir" : "file"), raw: e };
+      }
+      cur = cur._children[part];
+    }
+  }
+  function render(nodeChildren, prefix = "") {
+    const names = Object.keys(nodeChildren || {}).sort((a, b) => a.localeCompare(b));
+    const out = [];
+    for (let i = 0; i < names.length; i++) {
+      const name = names[i];
+      const isLast = i === names.length - 1;
+      const meta = nodeChildren[name]._meta;
+      const typ = (meta && meta.type) ? meta.type : "file";
+      const line = `${prefix}${isLast ? "└─ " : "├─ "}${name}${typ && typ.startsWith("dir") ? "/" : ""}`;
+      out.push(line);
+      const child = nodeChildren[name]._children;
+      if (child && Object.keys(child).length) {
+        out.push(...render(child, `${prefix}${isLast ? "   " : "│  "}`));
+      }
+    }
+    return out;
+  }
+  const rootChildren = map._children || map;
+  return [`📂 Tree: ${rootPath || "/"}`, ...render(rootChildren)];
+}
+
 bot.onText(/^\/tree(?:\s+(.*))?$/i, async (msg, m) => {
   const deviceId = await getSelectedDevice(msg.chat.id);
   if (!deviceId) return;
@@ -391,7 +435,7 @@ bot.onText(/^\/tree(?:\s+(.*))?$/i, async (msg, m) => {
   try {
     const cmd = await sendCommand(deviceId, "list_files", { path, recursive: true, maxDepth: 5, limit: 1500 });
     const res = await waitForResultRealtime(cmd.id, 120_000);
-    const payload = res?.result ?? res ?? {};
+    const payload = unwrapResult(res) ?? {};
 
     if (payload && payload.cwd) st.cwd = payload.cwd;
 
@@ -414,7 +458,7 @@ bot.onText(/^\/tree(?:\s+(.*))?$/i, async (msg, m) => {
   }
 });
 
-/* ===== /upload (improved payload handling + bucket=mydrive) ===== */
+/* ===== /upload (improved payload handling; bucket=mydrive) ===== */
 bot.onText(/^\/upload\s+(.+)$/i, async (msg, m) => {
   const chatId = msg.chat.id;
   const deviceId = await getSelectedDevice(chatId);
@@ -427,30 +471,44 @@ bot.onText(/^\/upload\s+(.+)$/i, async (msg, m) => {
   try {
     const prepCmd = await sendCommand(deviceId, "prepare_upload", { filename: path });
     const prepRes = await waitForResultRealtime(prepCmd.id, 90_000);
-    const prepPayload = prepRes?.result ?? prepRes;
+    const prepPayload = unwrapResult(prepRes);
     if (!prepPayload) {
       bot.sendMessage(chatId, "❌ prepare_upload failed (no payload)");
       return;
     }
 
+    // build source that edge function expects
+    const source = {
+      is_content_uri: !!prepPayload.is_content_uri,
+      uri: prepPayload.uri || prepPayload.file_uri || null,
+      file_path: prepPayload.path || prepPayload.file_path || prepPayload.meta?.path || path,
+      meta: prepPayload,
+    };
+
+    const destName = (prepPayload.name || path.split("/").pop() || "file").replace(/\s+/g, "_");
     const payload = {
       device_id: deviceId,
-      source: prepPayload,
-      bucket: "mydrive", // <- updated bucket name per your request
-      dest: `${deviceId}/${Date.now()}_${(prepPayload.name || "file")}`,
+      bucket: "mydrive", // user requested bucket name
+      dest: `${deviceId}/${Date.now()}_${destName}`,
+      source,
     };
 
     bot.sendMessage(chatId, "☁️ Uploading to Supabase Storage…");
 
     const { data, error } = await supabase.functions.invoke("upload-file", { body: payload });
     if (error) {
-      // include any response body if present
-      const msg = error?.message || JSON.stringify(error);
-      bot.sendMessage(chatId, `❌ Upload failed: ${msg}`);
+      // edge function returned non-2xx or supabase wrapper error
+      bot.sendMessage(chatId, `❌ Upload failed: ${error.message || JSON.stringify(error)}`);
       return;
     }
 
-    bot.sendMessage(chatId, `✅ Upload complete\nBucket: ${data?.bucket}\nPath: ${data?.path}`);
+    // edge function returned a response body
+    if (data && data.error) {
+      bot.sendMessage(chatId, `❌ Upload failed (function): ${data.error} ${data.detail ? ` - ${JSON.stringify(data.detail)}` : ""}`);
+      return;
+    }
+
+    bot.sendMessage(chatId, `✅ Upload complete\nBucket: ${data.bucket}\nPath: ${data.path}\nSize: ${data.size ?? "unknown"}`);
   } catch (e) {
     bot.sendMessage(chatId, `❌ upload error: ${e.message || e}`);
   }
@@ -469,7 +527,7 @@ bot.onText(/^\/rm\s+(.+)$/i, async (msg, m) => {
   try {
     const cmd = await sendCommand(deviceId, "delete_file", { path });
     const res = await waitForResultRealtime(cmd.id, 30_000);
-    const payload = res?.result ?? res;
+    const payload = unwrapResult(res);
     if (payload && payload.success) bot.sendMessage(chatId, `✅ Removed ${path}`);
     else bot.sendMessage(chatId, `❌ remove failed: ${JSON.stringify(payload || res || {})}`);
   } catch (e) {
@@ -490,7 +548,7 @@ bot.onText(/^\/rd\s+(.+)$/i, async (msg, m) => {
   try {
     const cmd = await sendCommand(deviceId, "delete_dir", { path });
     const res = await waitForResultRealtime(cmd.id, 60_000);
-    const payload = res?.result ?? res;
+    const payload = unwrapResult(res);
     if (payload && payload.success) bot.sendMessage(chatId, `✅ Removed directory ${path}`);
     else bot.sendMessage(chatId, `❌ rd failed: ${JSON.stringify(payload || res || {})}`);
   } catch (e) {
@@ -505,7 +563,7 @@ bot.onText(/^\/ping$/i, async (msg) => {
   try {
     const cmd = await sendCommand(deviceId, "ping");
     const res = await waitForResultRealtime(cmd.id, 20_000);
-    const payload = res?.result ?? res;
+    const payload = unwrapResult(res) ?? {};
     if (payload && payload.ts) bot.sendMessage(msg.chat.id, `🏓 Pong — ts: ${payload.ts}`);
     else bot.sendMessage(msg.chat.id, "🏓 Pong");
   } catch (e) {
@@ -520,22 +578,22 @@ bot.onText(/^\/info$/i, async (msg) => {
   try {
     const cmd = await sendCommand(deviceId, "device_info");
     const res = await waitForResultRealtime(cmd.id, 20_000);
-    const payload = res?.result ?? res;
+    const payload = unwrapResult(res) ?? {};
 
     // update local cwd if device returns one
     const st = chatState.get(msg.chat.id);
     if (payload && payload.cwd && st) st.cwd = payload.cwd;
 
-    const text = formatInfo(payload);
+    const text = formatInfo(payload) || "No info.";
     for (const chunk of chunkMessage(text)) await bot.sendMessage(msg.chat.id, chunk);
   } catch (e) {
     bot.sendMessage(msg.chat.id, `❌ info failed: ${e.message || e}`);
   }
 });
 
-/* ================
+/* ===========================
    Webhook server + health
-   ================ */
+   =========================== */
 
 async function ensureWebhook() {
   try {
@@ -550,7 +608,6 @@ async function ensureWebhook() {
   }
 }
 
-// set webhook once
 await ensureWebhook();
 
 const server = http.createServer(async (req, res) => {
