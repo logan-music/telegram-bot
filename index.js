@@ -457,16 +457,16 @@ bot.onText(/^\/upload\s+(.+)$/i, async (msg, m) => {
   try {
     const prepCmd = await sendCommand(deviceId, "prepare_upload", { filename: path });
     const prepRes = await waitForResultRealtime(prepCmd.id, 90_000);
-    if (!prepRes || prepRes.status !== "done") {
-      bot.sendMessage(chatId, "❌ prepare_upload failed");
+    const prepPayload = prepRes?.result ?? prepRes;
+    if (!prepPayload) {
+      bot.sendMessage(chatId, "❌ prepare_upload failed (no payload)");
       return;
     }
-
     const payload = {
       device_id: deviceId,
-      source: prepRes.result ?? {},
+      source: prepPayload,
       bucket: "agent-uploads",
-      dest: `${deviceId}/${Date.now()}_${(prepRes.result?.name || "file")}`,
+      dest: `${deviceId}/${Date.now()}_${(prepPayload.name || "file")}`,
     };
 
     bot.sendMessage(chatId, "☁️ Uploading to Supabase Storage…");
