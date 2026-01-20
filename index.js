@@ -59,7 +59,10 @@ function formatInfo(obj) {
   return lines.join("\n");
 }
 
-function formatListingPlain(result, requestedPath = "") {
+/**
+ * formatListingPlain: returns plain, human-friendly list (folders first then files)
+ */
+function formatListingPlain(result) {
   const lines = [];
   if (!result) {
     lines.push("No result.");
@@ -80,7 +83,7 @@ function formatListingPlain(result, requestedPath = "") {
     // sort alphabetically within groups
     folders.sort((a,b)=>a.localeCompare(b));
     files.sort((a,b)=>a.localeCompare(b));
-    // combine (folders first, then files) as requested
+    // combine (folders first, then files)
     for (const f of folders) lines.push(f);
     for (const f of files) lines.push(f);
     return lines;
@@ -104,7 +107,7 @@ function formatListingPlain(result, requestedPath = "") {
     return lines;
   }
 
-  // Last fallback: pretty JSON string but plain text (avoid Markdown entities)
+  // Last fallback: pretty JSON string but plain text
   try {
     lines.push(JSON.stringify(result, null, 2));
   } catch (e) {
@@ -162,6 +165,9 @@ async function sendCommand(deviceId, action, payload = {}) {
   return data;
 }
 
+/* ===========================
+   Realtime wait (subscribe + polling fallback)
+   =========================== */
 function waitForResultRealtime(cmdId, timeoutMs = 90_000) {
   if (!cmdId) return Promise.reject(new Error("missing_cmd_id"));
   if (pendingSubs.has(cmdId)) return pendingSubs.get(cmdId).promise;
@@ -360,11 +366,15 @@ bot.onText(/^\/ls(?:\s+(.*))?$/i, async (msg, m) => {
     const cmd = await sendCommand(deviceId, "list_files", { path, limit: 500 });
     // give ls a bit more time (30s)
     const res = await waitForResultRealtime(cmd.id, 30_000);
-    const payload = res?.result || {};
+    // unwrap result properly
+    const payload = res?.result ?? res ?? {};
+    if (payload && payload.cwd) st.cwd = payload.cwd;
 
-    if (payload.cwd) st.cwd = payload.cwd;
-
-    const lines = formatListingPlain(payload, path);
+    const lines = formatListingPlain(payload);
+    if (lines.length === 0) {
+      bot.sendMessage(msg.chat.id, "No entries.");
+      return;
+    }
     for (const chunk of chunkMessage(lines.join("\n"))) await bot.sendMessage(msg.chat.id, chunk);
   } catch (e) {
     bot.sendMessage(msg.chat.id, `❌ ls failed: ${e.message || e}`);
@@ -381,7 +391,7 @@ bot.onText(/^\/tree(?:\s+(.*))?$/i, async (msg, m) => {
   try {
     const cmd = await sendCommand(deviceId, "list_files", { path, recursive: true, maxDepth: 5, limit: 1500 });
     const res = await waitForResultRealtime(cmd.id, 120_000);
-    const payload = (res && (res.result ?? res)) || res;
+    const payload = res?.result ?? res ?? {};
 
     if (payload && payload.cwd) st.cwd = payload.cwd;
 
@@ -404,7 +414,7 @@ bot.onText(/^\/tree(?:\s+(.*))?$/i, async (msg, m) => {
   }
 });
 
-/* ===== /upload (improved payload handling) ===== */
+/* ===== /upload (improved payload handling + bucket=mydrive) ===== */
 bot.onText(/^\/upload\s+(.+)$/i, async (msg, m) => {
   const chatId = msg.chat.id;
   const deviceId = await getSelectedDevice(chatId);
@@ -426,7 +436,7 @@ bot.onText(/^\/upload\s+(.+)$/i, async (msg, m) => {
     const payload = {
       device_id: deviceId,
       source: prepPayload,
-      bucket: "mydrive",
+      bucket: "mydrive", // <- updated bucket name per your request
       dest: `${deviceId}/${Date.now()}_${(prepPayload.name || "file")}`,
     };
 
@@ -434,16 +444,19 @@ bot.onText(/^\/upload\s+(.+)$/i, async (msg, m) => {
 
     const { data, error } = await supabase.functions.invoke("upload-file", { body: payload });
     if (error) {
-      bot.sendMessage(chatId, `❌ Upload failed: ${error.message}`);
+      // include any response body if present
+      const msg = error?.message || JSON.stringify(error);
+      bot.sendMessage(chatId, `❌ Upload failed: ${msg}`);
       return;
     }
 
-    bot.sendMessage(chatId, `✅ Upload complete\nBucket: ${data.bucket}\nPath: ${data.path}`);
+    bot.sendMessage(chatId, `✅ Upload complete\nBucket: ${data?.bucket}\nPath: ${data?.path}`);
   } catch (e) {
     bot.sendMessage(chatId, `❌ upload error: ${e.message || e}`);
   }
 });
 
+/* ===== /rm (remove file) ===== */
 bot.onText(/^\/rm\s+(.+)$/i, async (msg, m) => {
   const chatId = msg.chat.id;
   const deviceId = await getSelectedDevice(chatId);
@@ -464,9 +477,7 @@ bot.onText(/^\/rm\s+(.+)$/i, async (msg, m) => {
   }
 });
 
-/* ===== /rd (remove directory recursively) =====
-   Sends action 'delete_dir' (agent should implement)
-*/
+/* ===== /rd (remove directory recursively) ===== */
 bot.onText(/^\/rd\s+(.+)$/i, async (msg, m) => {
   const chatId = msg.chat.id;
   const deviceId = await getSelectedDevice(chatId);
@@ -479,7 +490,7 @@ bot.onText(/^\/rd\s+(.+)$/i, async (msg, m) => {
   try {
     const cmd = await sendCommand(deviceId, "delete_dir", { path });
     const res = await waitForResultRealtime(cmd.id, 60_000);
-    const payload = res.result?.result ?? res.result ?? res;
+    const payload = res?.result ?? res;
     if (payload && payload.success) bot.sendMessage(chatId, `✅ Removed directory ${path}`);
     else bot.sendMessage(chatId, `❌ rd failed: ${JSON.stringify(payload || res || {})}`);
   } catch (e) {
@@ -539,6 +550,7 @@ async function ensureWebhook() {
   }
 }
 
+// set webhook once
 await ensureWebhook();
 
 const server = http.createServer(async (req, res) => {
@@ -580,11 +592,9 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, async () => {
+server.listen(PORT, () => {
   console.log(`🚀 Webhook server listening on port ${PORT}`);
   console.log(`Webhook endpoint: POST ${WEBHOOK_URL.replace(/\/$/, "")}/bot${BOT_TOKEN}`);
-
-  await ensureWebhook();
 });
 
 /* housekeeping: friendly error guards */
