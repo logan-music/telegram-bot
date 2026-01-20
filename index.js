@@ -173,10 +173,6 @@ async function sendCommand(deviceId, action, payload = {}) {
   return data;
 }
 
-/* ===========================
-   Realtime wait (subscribe + polling fallback)
-   same as before (realtime first, poll fallback)
-   =========================== */
 function waitForResultRealtime(cmdId, timeoutMs = 90_000) {
   if (!cmdId) return Promise.reject(new Error("missing_cmd_id"));
   if (pendingSubs.has(cmdId)) return pendingSubs.get(cmdId).promise;
@@ -459,10 +455,6 @@ bot.onText(/^\/upload\s+(.+)$/i, async (msg, m) => {
   }
 });
 
-/* ===== /rm (remove file) =====
-   Sends action 'delete_file' with payload { path }
-   Waits for result and reports back.
-*/
 bot.onText(/^\/rm\s+(.+)$/i, async (msg, m) => {
   const chatId = msg.chat.id;
   const deviceId = await getSelectedDevice(chatId);
@@ -498,7 +490,7 @@ bot.onText(/^\/rd\s+(.+)$/i, async (msg, m) => {
   try {
     const cmd = await sendCommand(deviceId, "delete_dir", { path });
     const res = await waitForResultRealtime(cmd.id, 60_000);
-    const payload = res?.result ?? res;
+    const payload = res.result?.result ?? res.result ?? res;
     if (payload && payload.success) bot.sendMessage(chatId, `✅ Removed directory ${path}`);
     else bot.sendMessage(chatId, `❌ rd failed: ${JSON.stringify(payload || res || {})}`);
   } catch (e) {
