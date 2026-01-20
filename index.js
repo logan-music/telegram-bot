@@ -59,19 +59,8 @@ function formatInfo(obj) {
   return lines.join("\n");
 }
 
-/**
- * New formatListing: returns plain, human-friendly list (folders first then files)
- * Example output:
- * Android
- * Images
- * Download
- * Movies
- * test.py
- * 5000.py
- */
 function formatListingPlain(result, requestedPath = "") {
   const lines = [];
-  lines.push(`Listing: ${requestedPath || ""}`);
   if (!result) {
     lines.push("No result.");
     return lines;
@@ -371,9 +360,9 @@ bot.onText(/^\/ls(?:\s+(.*))?$/i, async (msg, m) => {
     const cmd = await sendCommand(deviceId, "list_files", { path, limit: 500 });
     // give ls a bit more time (30s)
     const res = await waitForResultRealtime(cmd.id, 30_000);
-    const payload = (res && (res.result ?? res)) || res;
+    const payload = res?.result || {};
 
-    if (payload && payload.cwd) st.cwd = payload.cwd;
+    if (payload.cwd) st.cwd = payload.cwd;
 
     const lines = formatListingPlain(payload, path);
     for (const chunk of chunkMessage(lines.join("\n"))) await bot.sendMessage(msg.chat.id, chunk);
@@ -437,7 +426,7 @@ bot.onText(/^\/upload\s+(.+)$/i, async (msg, m) => {
     const payload = {
       device_id: deviceId,
       source: prepPayload,
-      bucket: "agent-uploads",
+      bucket: "mydrive",
       dest: `${deviceId}/${Date.now()}_${(prepPayload.name || "file")}`,
     };
 
