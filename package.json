@@ -1,0 +1,27 @@
+{
+  "name": "media-agent-telegram-bot",
+  "version": "1.0.0",
+  "description": "Production Telegram bot for Media Agent - integrates with Flutter app and Supabase",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "keywords": [
+    "telegram",
+    "bot",
+    "media",
+    "agent",
+    "supabase"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@supabase/supabase-js": "^2.39.0",
+    "node-telegram-bot-api": "^0.64.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
